@@ -9,6 +9,7 @@ using Rebus.Logging;
 using Rebus.Messages;
 using Rebus.Shared;
 using Rebus.Timeout;
+using System.Threading;
 
 namespace Rebus.Bus
 {
@@ -300,7 +301,24 @@ This most likely indicates that you have configured this Rebus service to use an
             var asyncHandler = handler as IHandleMessagesAsync<TMessage>;
             if (asyncHandler != null)
             {
-                Task.WaitAll(asyncHandler.Handle(message));
+                var before = SynchronizationContext.Current;
+
+                try
+                {
+                    var ctx = new DispatcherSynchronizationContext(TransactionContext.Current, MessageContext.GetCurrent());
+                    SynchronizationContext.SetSynchronizationContext(ctx);
+
+                    var scheduler = TaskScheduler.FromCurrentSynchronizationContext();
+
+                    var task = new Task(() => asyncHandler.Handle(message).Wait());
+                    task.Start(scheduler);
+
+                    ctx.Completion.Wait();
+                }
+                finally
+                {
+                    SynchronizationContext.SetSynchronizationContext(before);
+                }
             }
         }
 
@@ -400,4 +418,91 @@ This most likely indicates that you have configured this Rebus service to use an
             return sagaData;
         }
     }
+
+    public class DispatcherSynchronizationContext : SynchronizationContext
+    {
+        private int operationCount;
+
+        private readonly TaskCompletionSource<object> completion;
+
+        public ITransactionContext TransactionContext { get; private set; }
+        public IMessageContext MessageContext { get; private set; }
+
+        public Task Completion { get { return this.completion.Task; } }
+
+        public DispatcherSynchronizationContext(ITransactionContext transactionContext, IMessageContext messageContext)
+        {
+            this.TransactionContext = transactionContext;
+            this.MessageContext = messageContext;
+
+            this.completion = new TaskCompletionSource<object>();
+        }
+
+        public override SynchronizationContext CreateCopy()
+        {
+            return new DispatcherSynchronizationContext(this.TransactionContext, this.MessageContext);
+        }
+
+        public override void OperationCompleted()
+        {
+            if (Interlocked.Decrement(ref this.operationCount) == 0)
+            {
+                this.completion.SetResult(null);
+            }
+        }
+
+        public override void OperationStarted()
+        {
+            if (this.completion.Task.IsCompleted)
+            {
+                throw new InvalidOperationException();
+            }
+
+            Interlocked.Increment(ref this.operationCount);
+        }
+
+        public override void Post(SendOrPostCallback d, object state)
+        {
+            var previousSyncCtx = SynchronizationContext.Current;
+            var previousTransactionCtx = Rebus.Bus.TransactionContext.Current;
+            var previousMessageCtx = Rebus.MessageContext.HasCurrent ? Rebus.MessageContext.GetCurrent() : null;
+
+            this.OperationStarted();
+
+            Task.Factory.StartNew(() =>
+            {
+                try
+                {
+                    SynchronizationContext.SetSynchronizationContext(this);
+
+                    //None of this should be needed if TransactionContext and MessageContext code
+                    //changed to read from SynchronizationContext.Current before checking ThreadStatic
+                    //eventually deprecate all ThreadStatic references
+                    Rebus.Bus.TransactionContext.Set(this.TransactionContext);
+                    Rebus.MessageContext.current = this.MessageContext;
+
+                    d(state);
+                }
+                finally
+                {
+                    this.OperationCompleted();
+
+                    SynchronizationContext.SetSynchronizationContext(previousSyncCtx);
+                    Rebus.MessageContext.current = previousMessageCtx;
+                    Rebus.Bus.TransactionContext.Set(previousTransactionCtx);
+                }
+            });
+        }
+
+        public override void Send(SendOrPostCallback d, object state)
+        {
+            base.Send(d, state);
+        }
+
+        public override int Wait(IntPtr[] waitHandles, bool waitAll, int millisecondsTimeout)
+        {
+            return base.Wait(waitHandles, waitAll, millisecondsTimeout);
+        }
+    }
 }
+
